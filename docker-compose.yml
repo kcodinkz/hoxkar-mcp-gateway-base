@@ -1,0 +1,58 @@
+# 本地开发基础设施：统一使用 pgvector/pgvector:pg18 单实例
+# 该镜像内含 PostgreSQL 18 + vector / pg_trgm / pgcrypto 扩展
+#
+# 用法：
+#   docker compose up -d
+#   docker compose logs -f postgres
+#
+# 若本机已存在占用 5432 端口的 postgres 容器，请先停掉它：
+#   docker stop <container-name>
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    container_name: mcp-gw-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mcp
+      POSTGRES_PASSWORD: mcp_dev_password
+      POSTGRES_DB: mcp_gateway
+      # 本地开发用，生产请勿如此设置
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      # PG18 起官方镜像改了挂载点：数据实际落在
+      # /var/lib/postgresql/<major>/docker 下，所以卷要挂在父目录。
+      # 若仍挂 /var/lib/postgresql/data，容器会在启动时报
+      # "there appears to be PostgreSQL data in /var/lib/postgresql/data
+      #  (unused mount/volume)" 并无限重启。
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcp -d mcp_gateway"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 可选：r-nacos（Rust 版 Nacos）—— 服务发现 + 配置中心 + MCP 服务注册表
+  # 默认不随 `docker compose up` 启动，需显式指定 profile：
+  #   docker compose --profile discovery up -d
+  # 首次启动后立即修改控制台默认账号，且不要把 8848 暴露到公网。
+  rnacos:
+    image: qingpan/rnacos:stable
+    container_name: mcp-gw-rnacos
+    profiles: ["discovery"]
+    restart: unless-stopped
+    ports:
+      - "8848:8848"    # HTTP 控制台 + OpenAPI
+      - "9848:9848"    # gRPC，网关作为客户端连接
+      - "10848:10848"  # gRPC 附加端口（集群/扩展）
+    environment:
+      RNACOS_HTTP_PORT: "8848"
+      RNACOS_GRPC_PORT: "9848"
+    volumes:
+      - rnacosdata:/io
+
+volumes:
+  pgdata:
+  rnacosdata:

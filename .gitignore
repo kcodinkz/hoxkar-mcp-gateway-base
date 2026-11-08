@@ -1,0 +1,48 @@
+# 二进制产物
+hoxkar-mcp-gateway.exe
+hoxkar-mcp-gateway
+mcp-gateway.exe
+mcp-gateway
+*.exe
+*.test
+*.out
+coverage.*
+
+# 本地配置与凭据（样例文件 config.yaml.example 必须入库）
+config.yaml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+# 设计/方案类文档只留本地，不入库。
+# 仓库对外只发布 README.md 与 README.zh-CN.md（安装与用法）。
+docs
+
+# 本地私人笔记
+NOTES.md
+TODO.md
+scratch*.md
+
+# 注意：不要忽略 *_test.go。
+# 单元测试是 ID 形态、分片粘性、NOT NULL 策略这些
+# 硬约束的唯一可执行证明；一旦被忽略，新克隆的仓库将无法验证任何一条约束，
+# 也无法在 CI 里拦截回归。历史上有过 *_test.go 规则，导致
+# internal/store/lifecycle_test.go 长期没进版本控制，切勿再加回来。
+
+# 注意：不要写 *.sql 或 migrations。
+# migrations/*.sql 通过 go:embed 编进二进制，是本项目的核心基线；
+# 一旦被忽略，全新克隆后的构建会因 embed 目录为空而直接失败。
+# 若需要排除临时 SQL，请显式写具体文件名，例如 tmp_*.sql。
+
+# 本地数据
+*.duckdb
+data/
+tmp/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,18 @@
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.md   text eol=lf
+*.sql  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.sum  text eol=lf
+*.mod  text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary

@@ -1,0 +1,196 @@
+# hoxkar-mcp-gateway 配置文件样例
+# 复制为 config.yaml 后按需修改。config.yaml 已加入 .gitignore，不会入库。
+#
+# 启动：
+#   .\mcp-gateway.exe --config config.yaml --command "<后端 MCP 命令>"
+#
+# 环境变量可覆盖以下任意项，命名规则 MCPGW_ + 路径大写，用下划线连接：
+#   MCPGW_SERVER_PORT / MCPGW_SERVER_BASE_URL
+#   MCPGW_DATABASE_DSN / MCPGW_DATABASE_MAX_CONNS
+#   MCPGW_AUTH_ADMIN_TOKEN / MCPGW_AUTH_BEARER_TOKEN
+#   MCPGW_IDGEN_NODE_ID
+#   MCPGW_DISCOVERY_PROVIDER / MCPGW_DISCOVERY_FAIL_OPEN
+#   MCPGW_DISCOVERY_RNACOS_ADDR / _NAMESPACE / _USERNAME / _PASSWORD
+#   MCPGW_REGISTRY_AUTO_DISCOVER / _SYNC_INTERVAL_SECONDS
+#   MCPGW_REGISTRY_SERVICE_PREFIX / _ENDPOINT_PATH / _TIMEOUT_MS / _POOL_SIZE
+#   MCPGW_MAINTENANCE_ENABLED / MCPGW_MAINTENANCE_BATCH_SIZE
+#
+# 注意：本文件只放「改一行就要重启进程」的参数（动态配置）。
+# 额度、费率、邮件开关、录制上限等业务可变项一律在 system_settings 表里，
+# 由超级管理员通过 /admin/v1/settings 热更新，不要写到这里。
+
+server:
+  name: hoxkar-mcp-gateway
+  version: 1.0.0
+  port: 7979
+  base_url: http://127.0.0.1:7979
+  sse_path: /sse
+  message_path: /messages
+  # SSE 心跳间隔，0 表示关闭
+  keep_alive_seconds: 20
+  # 单次请求体上限，8 MiB
+  max_body_bytes: 8388608
+  cors_allow_origins:
+    - "*"
+
+database:
+  # 留空则进入单 token 兼容模式或开发模式
+  dsn: postgres://mcp:mcp_dev_password@127.0.0.1:5432/mcp_gateway?sslmode=disable
+  max_conns: 10
+  # 分片库 DSN（租户与分片）。单库阶段留空即可：所有分片共用上面那个 dsn，
+  # 分片号只体现在 ID 里。将来拆库时按「分片号: DSN」加条目，
+  # 代码无需改动；分片号合法性由 shard.Parse 在启动时校验。
+  #
+  # shard_dsns:
+  #   "03": postgres://mcp:mcp_dev_password@10.0.0.13:5432/mcp_gateway_shard03?sslmode=disable
+  #   "07": postgres://mcp:mcp_dev_password@10.0.0.17:5432/mcp_gateway_shard07?sslmode=disable
+  shard_dsns: {}
+
+auth:
+  # 多租户模式下必须设置，用于 /admin/v1/* 管理接口
+  admin_token: change-me-admin-token
+  # 仅用于单 token 兼容模式（等价于旧 --oauth2Bearer）
+  bearer_token: ""
+  # API Key 校验结果的本地缓存时间
+  key_cache_ttl_seconds: 30
+  default_rate_limit_per_minute: 60
+
+# 后台维护循环（预扣超时释放 + 企业租户到期降级）
+#
+# 扫描频率放这里而不是 system_settings：它不是业务策略，而是与部署形态、
+# 数据库规格绑定的运维参数，改它需要重启。真正的业务口径（预扣多久算超时、
+# 初始赠额多少）仍然在 system_settings 里由超级管理员热更新（动态配置）。
+maintenance:
+  # 关闭后网关不再主动扫描：租户到期不翻状态、预扣超时不释放。
+  # 只在排查问题时临时关闭——长期关闭会导致额度被永久冻结。
+  enabled: true
+  # 预扣单超时扫描间隔（秒），对应计量计费
+  reservation_sweep_seconds: 60
+  # 企业租户到期降级扫描间隔（秒），对应租户与分片 §9.4
+  # 与预扣扫描分开：两者失败的后果不同，不该互相拖累
+  tenant_expiry_sweep_seconds: 60
+  # 单轮处理上限（条）。积压多时多轮推进，避免一次锁表过久。
+  # 上限 500：ExpireStaleReservations 内部会把越界值改写，
+  # 配置层提前收敛，避免「写了 1000 实际跑 100」的错觉。
+  batch_size: 200
+
+# 雪花 ID 生成器（ID 形态，所有主键都必须走这里）
+# node_id 取值 0-1023，多副本部署时每个实例必须不同，否则会撞号。
+idgen:
+  node_id: 0
+
+# 会话录制（管理员可见，用于后期模型训练语料）
+# 用户端永远看不到这些数据，只在 /admin/v1/sessions 下暴露给管理员。
+# 严禁把录制内容回显到 /sse 或 /messages 的响应里。
+session_recording:
+  # 关闭后网关不写录制表，调试性能问题时可用
+  enabled: true
+  # 单条消息正文截断上限（字节），超出部分丢弃并置 truncated = true
+  max_payload_bytes: 1048576
+  # 是否录制工具调用参数与返回结果（tools/call 的 arguments / result）
+  capture_tool_payloads: true
+  # 是否对敏感字段做脱敏（api key、token、password、secret、authorization）
+  redact_sensitive: true
+  # 录制数据保留天数，0 表示永久保留
+  retention_days: 0
+
+# 服务发现（服务发现）：网关只做「发现者」，不做「注册者」。
+# Rust 后端启动时自行注册到 r-nacos 并持续心跳；网关定期拉取健康实例列表，
+# 完成 API Key 鉴权后把请求转发过去。因此这里不需要配置任何后端地址清单
+# （static 除外，见下）。
+discovery:
+  # static：直接从 static_endpoints 读，适合本地不启 r-nacos 的场景
+  # rnacos：从 r-nacos 拉取实例列表
+  provider: static
+  # 实例列表缓存秒数，避免每个请求都打 r-nacos
+  cache_ttl_seconds: 10
+  # r-nacos 挂掉时是否放行到 static_endpoints 兜底。生产建议 true，
+  # 但必须同时配置 static_endpoints，否则 Validate 会拒绝启动。
+  fail_open: true
+  # 兜底实例，格式 ip:port。provider=static 时就是唯一数据源。
+  static_endpoints:
+    - "127.0.0.1:8080"
+  rnacos:
+    addr: http://127.0.0.1:8848
+    namespace: public
+    group: DEFAULT_GROUP
+    username: ""
+    password: ""
+    timeout_seconds: 5
+    # 只取健康实例；不健康的一律丢弃，不做「碰运气转发」
+    healthy_only: true
+
+# 注册中心自动同步（注册中心同步）
+#
+# 这是「新增 MCP 服务时网关侧零改动」的落地位置：接入方把服务注册进 r-nacos，
+# 同步器把它变成一行命名空间。网关不改代码、不改 config.yaml、不改 SQL。
+#
+# 与 discovery 段的分工必须分清：
+#   discovery 回答「某个服务名现在有哪些健康实例」 → 服务于请求转发
+#   registry  回答「注册中心里到底有哪些服务」     → 服务于建表
+#
+# 命名映射规则：服务名 mcp-blender → 剥掉前缀 → slug=blender。
+# 接入方只要按 mcp-<名字> 注册服务，网关侧不需要做任何配置。
+registry:
+  # 默认 false：同步器会写数据库，一个没想清楚的部署被自动塞进
+  # 一堆命名空间之后，回滚要一行行手工清理。确认要用再打开。
+  #
+  # 打开条件：discovery.provider 必须为 rnacos。static 只有一组写死的地址，
+  # 没有「注册中心里有哪些服务」这个概念，Validate 会直接拒绝这种组合。
+  auto_discover: false
+  # 同步周期（秒）。不宜过短：每轮是一次全量 List + 全表 registry 行比对；
+  # 也不宜过长：接入方删掉服务后，网关会继续往已下线的名字上转发。
+  sync_interval_seconds: 60
+  # 只同步以此开头的服务名，生成 slug 时剥掉。
+  #
+  # 强烈建议保留：注册中心通常同时承载普通微服务（user-service 之类），
+  # 不设前缀会把它们统统变成 MCP 命名空间，管理端瞬间被垃圾数据填满。
+  # 留空（""）表示「注册中心里所有服务都是 MCP 服务」，这是一个需要
+  # 明确做出的决定，不要因为「省事」而留空。
+  service_prefix: "mcp-"
+  # 以下是自动建出来的命名空间的默认模板。
+  # 注意：这些值只在「首次创建」时生效；之后管理员在后台调过的值
+  # 会被同步器原样保留，不会被每轮同步抹回默认值。
+  endpoint_path: /mcp
+  timeout_ms: 120000
+  pool_size: 1
+
+# 命名空间启动时按 slug 幂等写入数据库（source='config'）。
+#
+# 这里只放 stdio 命名空间：命令、参数、环境变量这些东西注册中心不知道，
+# 只能由配置文件声明。所有 http 命名空间都应当交给上面的 registry 自动同步，
+# 不要再往这里加 —— 写死清单与「基于注册中心动态管理」是直接冲突的。
+#
+# 两种 transport（服务发现）：
+#   stdio —— 网关拉起本地子进程，用 command / args / env，由进程池管理
+#   http  —— 后端是独立服务，网关只按服务名去发现层找实例并转发
+#            （http 的 discovery_* 字段仍然可用，用于临时绕过同步器手工调试）
+namespaces:
+  # 本地子进程（stdio）。保留一个 default 是为了兼容旧的 /sse 与 /messages 路径，
+  # 以及老的启动脚本里 -command 的用法。
+  - slug: default
+    description: 默认命名空间，兼容旧的 /sse 与 /messages 路径
+    transport: stdio
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/servers"
+      - "src/filesystem"
+      - "c:/temp"
+    pool_size: 1
+    timeout_ms: 120000
+    enabled: true
+
+  # 临时手工调试用的 http 命名空间（默认注释掉）。
+  # 正常情况下应删掉，改为把服务注册进 r-nacos 并打开 registry.auto_discover。
+  #
+  # - slug: blender
+  #   description: Blender MCP 后端（临时手工指定，正式环境请走注册中心同步）
+  #   transport: http
+  #   discovery_provider: rnacos
+  #   discovery_service: mcp-blender
+  #   discovery_group: DEFAULT_GROUP
+  #   endpoint_path: /mcp
+  #   lb_strategy: round_robin
+  #   timeout_ms: 300000
+  #   enabled: false
