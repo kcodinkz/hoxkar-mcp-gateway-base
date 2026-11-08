@@ -28,6 +28,9 @@ those backends from a service registry (r-nacos) instead of a hard-coded list.
 - [Project layout](#project-layout)
 - [Roadmap](#roadmap)
 - [Known limitations](#known-limitations)
+- [💡 A Note on Scope & Evolution](#-a-note-on-scope--evolution)
+- [Acknowledgements and donations](#acknowledgements-and-donations)
+- [License](#license)
 - [中文文档](./README.zh-CN.md)
 
 ---
@@ -632,12 +635,31 @@ These are real, present constraints — not a wish list:
    implementation here.
 3. **No API-key middleware and no namespace routing.** Requests are not yet authenticated per key and
    not yet routed per namespace.
-4. **Repository line endings are mixed (CRLF and LF) with no `.gitattributes`.** `gofmt -l` therefore
-   reports most files, because it only accepts LF. Normalising this is a standalone change, never a
-   side effect of a feature commit.
-5. **Repository line endings are mixed.** Most files are CRLF, but `gofmt` only accepts LF, so
-   `gofmt -l` flags them. Normalising this is a standalone change, never a side effect of a feature
-   commit.
+4. **No standalone `LICENSE` file.** The licence terms live in the [License](#license) section below;
+   a machine-readable file is still missing.
+
+---
+
+## 💡 A Note on Scope & Evolution
+
+This repository (`hoxkar-mcp-gateway-base`) represents **only the foundational, open control plane**—the plumbing required to bridge, discover, and securely route Model Context Protocol traffic.
+
+It is deliberately scoped as a clean, production-ready shortcut for developers who need multi-tenant MCP routing out of the box. However, it is just the tip of the iceberg.
+
+The real system—our core proprietary engine powering distributed domain-specific pipelines, stateful async workflows, and enterprise-grade execution mesh—operates entirely behind closed doors.
+
+*If your use case goes beyond basic gateway routing and you are looking to integrate advanced vertical pipelines, custom multi-agent execution, or commercial licensing, reach out directly.*
+
+---
+
+## Acknowledgements and donations
+
+Donations are welcome and entirely optional. They buy no support commitment, no priority and no
+licence rights — the terms that apply to this source code are in the [License](#license) section.
+
+| Bitcoin (BTC) | EVM (ETH / BSC / Polygon …) | Solana (SOL) |
+| --- | --- | --- |
+| <img src="./assets/btc.webp" alt="Bitcoin donation QR code" width="220" /> | <img src="./assets/EVM.webp" alt="EVM-compatible chains donation QR code" width="220" /> | <img src="./assets/solana.webp" alt="Solana donation QR code" width="220" /> |
 
 ---
 

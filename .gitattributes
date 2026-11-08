@@ -15,4 +15,5 @@
 *.jpeg binary
 *.gif  binary
 *.ico  binary
+*.webp binary
 *.pdf  binary
