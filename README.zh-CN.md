@@ -6,9 +6,9 @@
 它从服务注册中心（r-nacos）里发现。
 
 > **项目状态：pre-1.0，积极开发中。**
-> 持久化、服务发现、注册中心同步三层已完成并有测试覆盖。
-> API Key 鉴权中间件、`/admin/v1/*` 管理接口、命名空间路由层**尚未实现**，详见[路线图](#路线图)。
-> 部署前请先读[已知限制](#已知限制)。
+> 持久化、服务发现、注册中心同步、API Key 鉴权（缓存 + RBAC）、`/admin/v1/*` 管理接口
+> 与命名空间路由（stdio 进程池 + HTTP 后端）均已完成并有测试覆盖。
+> 管理面板的 Web UI 尚未构建，详见[路线图](#路线图)。部署前请先读[已知限制](#已知限制)。
 
 - [它解决什么问题](#它解决什么问题)
 - [架构](#架构)
@@ -120,6 +120,13 @@ MCP 服务器通常是 stdio 进程。要把它接进一个网络产品，每次
   并带一张修订历史表。
 - **NOT NULL 克制使用** —— 只在真正必要处使用，且启动时自检策略是否仍成立，让 schema 漂移
   在启动时暴露，而不是在运行时。
+- **统一 API Key 鉴权** —— Key 以哈希形式落库，校验一次后缓存，并带单 Key 限流与
+  命名空间/工具级权限（RBAC）；所有裁决都在触达后端之前完成。
+- **命名空间路由** —— `/sse/{ns}` 与 `/messages/{ns}` 按命名空间解析到对应后端：
+  本地调试走 stdio 进程池，集群流量走 HTTP 反代到发现层给出的实例；
+  每次 `tools/call` 都会经过路由层的工具级校验。
+- **管理接口** —— `/admin/v1/*` 覆盖租户、用户、Key、命名空间、动态配置、用量与会话审阅，
+  使用独立的管理 token 鉴权，绝不与 MCP 客户端凭据混用。
 
 ---
 
@@ -556,16 +563,21 @@ curl -X DELETE "http://127.0.0.1:8848/nacos/v1/ns/service?serviceName=mcp-syncpr
 ```
 .
 ├── main.go                  # 入口：参数解析、启动顺序、关闭顺序
+├── auth_setup.go            # 多租户模式的鉴权 + 管理端 + 路由装配
 ├── registry_sync.go         # 注册中心同步的装配
 ├── maintenance.go           # 后台扫描
 ├── bootstrap_gate.go        # 迁移后自检
 ├── gateway/
 │   ├── sse.go               # SSE 传输 + 消息端点
-│   └── connection.go        # stdio <-> SSE 桥接
+│   ├── connection.go        # stdio <-> SSE 桥接
+│   └── namespaced.go        # 命名空间 MCP 端点（/sse/{ns}、/messages/{ns}）
 ├── internal/
 │   ├── config/              # config.yaml 加载、环境变量覆盖、校验
 │   ├── discovery/           # 服务名 -> 健康实例（static | r-nacos）
 │   ├── registry/            # 注册中心目录 -> 命名空间行
+│   ├── routing/             # 命名空间 -> 后端（stdio 进程池、HTTP 反代）
+│   ├── auth/                # API Key 校验、缓存、中间件、RBAC
+│   ├── admin/               # /admin/v1/* 管理接口
 │   ├── store/               # PostgreSQL 访问，按领域一个文件
 │   ├── idgen/               # 带前缀的 ID 生成与解析
 │   ├── shard/               # 租户 -> 分片映射，按分片的连接池
@@ -574,7 +586,7 @@ curl -X DELETE "http://127.0.0.1:8848/nacos/v1/ns/service?serviceName=mcp-syncpr
 │   ├── billing/             # 计量、预扣、结算、释放
 │   └── recorder/            # 会话捕获 + 脱敏
 ├── migrations/              # 内嵌 SQL：schema、索引、种子
-└── examples/                # 最小示例后端
+└── examples/                # 最小示例后端 + 慢后端测试替身
 ```
 
 ---
@@ -585,9 +597,9 @@ curl -X DELETE "http://127.0.0.1:8848/nacos/v1/ns/service?serviceName=mcp-syncpr
 | --- | --- | --- |
 | **持久化** | schema、迁移、带前缀 ID、分片、动态配置 | ✅ 完成 |
 | **注册中心同步** | 目录轮询、upsert、软下线、来源隔离 | ✅ 完成 |
-| **鉴权** | API Key 校验、缓存中间件、RBAC、管理接口 | 🚧 未开始 |
-| **路由** | 命名空间路由与进程池、慢后端测试替身 | 🚧 未开始 |
-| **管理面板** | Web UI、发票、更细的计量 | 📋 计划中 |
+| **鉴权** | API Key 校验、缓存中间件、RBAC、管理接口 | ✅ 完成 |
+| **路由** | 命名空间路由与进程池、慢后端测试替身 | ✅ 完成 |
+| **管理面板** | Next.js 14 Web UI、发票、更细的计量 | 📋 计划中 |
 
 ---
 
@@ -595,12 +607,12 @@ curl -X DELETE "http://127.0.0.1:8848/nacos/v1/ns/service?serviceName=mcp-syncpr
 
 以下是当前真实存在的约束，不是愿望清单：
 
-1. **多租户模式下的 HTTP 服务路径还没接上。** 启动仍然走旧 SSE 服务器 + `--command`。
-   不带 `--command` 时进程以 `exec: no command` 退出。数据库、发现、同步都会先跑完，
-   所以症状是"干了一堆正确的事然后死掉"。
-2. **`auth.admin_token` 被要求填，但 `/admin/v1/*` 处理器还不存在。** 校验跑在实现前面。
-3. **没有 API Key 中间件，也没有命名空间路由。** 请求尚未按 Key 鉴权、按命名空间路由。
-4. **还没有独立的 `LICENSE` 文件。** 许可条款写在下文[许可](#许可)一节，机器可读的文件仍缺。
+1. **还没有管理面板 Web UI。** `/admin/v1/*` HTTP 接口已完成并有测试覆盖，但驱动它的界面尚未构建，
+   目前只能用 `curl` 完成管理操作。
+2. **旧版 `--command` 路径是刻意冻结的。** 它仍使用单一共享 token（`--oauth2Bearer`）、
+   按空格切分命令行，且完全不认识命名空间。请把它当作既有部署的兼容垫片，
+   而不是运行网关的推荐方式。
+3. **还没有独立的 `LICENSE` 文件。** 许可条款写在下文[许可](#许可)一节，机器可读的文件仍缺。
 
 ---
 

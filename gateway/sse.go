@@ -71,6 +71,31 @@ type SSEServer struct {
 
 	mu sync.RWMutex
 
+	// mounts 是挂在 SSE / message 端点之外的控制面处理器，例如 /admin/v1/*。
+	// 它们自带鉴权，因此必须在 ServeHTTP 里先于 -oauth2Bearer 校验被分派出去。
+	// 为空时行为与改造前完全一致。
+	mounts []mountEntry
+
+	// wrapper 是 SSE 主路径（/sse、/messages）的中间件链，例如 API Key 鉴权。
+	// 为 nil 时主路径不加任何中间件，保证旧启动方式零变化。
+	wrapper func(http.Handler) http.Handler
+
+	// mcpRouter 非 nil 时，主路径里属于 MCP 端点的请求（/sse、/sse/{ns}、
+	// /messages、/messages/{ns}）整段交给它处理。多租户模式下它是
+	// *NamespacedMCP：后端从 r-nacos 发现，而不是本地子进程。
+	//
+	// 它是「值」而非「包装」：wrapper 先跑完（API Key 鉴权、注入 Principal），
+	// 再由 serveMain 决定把请求交给谁。这一点不能反，否则 NamespacedMCP
+	// 拿不到调用者身份，RBAC 裁决无从谈起。
+	// 为 nil 时 serveMain 的分派逻辑与改造前逐行一致。
+	mcpRouter MCPRouter
+
+	// mainOnce / mainCached 让 wrapper 链只构建一次。
+	// ServeHTTP 每个请求都会经过这里，而 /messages 是高频端点，
+	// 没必要逐次重建闭包；TestServer 路径不经过 Start，因此惰性构建。
+	mainOnce   sync.Once
+	mainCached http.Handler
+
 	conn         *connection
 	oAuth2Bearer string
 }
@@ -163,6 +188,63 @@ func WithSSEContextFunc(fn SSEContextFunc) SSEOption {
 	}
 }
 
+// mountEntry 是一条「前缀 → 处理器」的挂载记录。
+//
+// 之所以记前缀而不是交给 http.ServeMux：SSEServer 本身就是一个 http.Handler，
+// 旧启动路径（无配置、无数据库）必须保持 s 原样交给 http.Server，
+// 不能为了挂一个控制面就把主路径包进 mux 里改变它的行为。
+type mountEntry struct {
+	prefix  string
+	handler http.Handler
+}
+
+// WithMount 把 handler 挂到指定路径前缀上。
+//
+// 被挂载的处理器必须自带鉴权：它在 -oauth2Bearer 校验之前被分派，
+// 因为 /admin/v1/* 用的是管理 token，与 MCP 的 Bearer 是两套凭据。
+func WithMount(prefix string, handler http.Handler) SSEOption {
+	return func(s *SSEServer) {
+		prefix = strings.TrimSuffix(prefix, "/")
+		if prefix == "" || handler == nil {
+			return
+		}
+		s.mounts = append(s.mounts, mountEntry{prefix: prefix, handler: handler})
+	}
+}
+
+// WithHandlerWrapper 给 SSE 主路径套一层中间件，典型用法是 API Key 鉴权。
+//
+// 只包主路径：挂载点（/admin/v1/*）走自己的鉴权，不能被这里二次拦截。
+func WithHandlerWrapper(wrapper func(http.Handler) http.Handler) SSEOption {
+	return func(s *SSEServer) {
+		s.wrapper = wrapper
+	}
+}
+
+// MCPRouter 是「主路径的命名空间分派器」，由 *NamespacedMCP 实现。
+//
+// 定义成接口而不是直接依赖 *NamespacedMCP，是为了让 sse.go 保持零业务依赖：
+// 它只需要知道「这条路径归不归你」和「交给你怎么处理」这两件事。
+type MCPRouter interface {
+	// Handles 报告该路径是否为 MCP 端点（含 /sse/{ns} 这类带前缀写法）。
+	Handles(path string) bool
+	// ServeHTTP 处理该请求。
+	ServeHTTP(w http.ResponseWriter, r *http.Request)
+}
+
+// WithMCPRouter 把 MCP 端点交给命名空间路由处理。
+//
+// 与 WithMount 的区别是分派时机：挂载点在校验之前（自带鉴权），
+// 而这个处理器在校验之后 —— 它依赖 wrapper 注入的 Principal 做 RBAC 裁决。
+// 传入 nil 等于不启用，行为与改造前一致。
+func WithMCPRouter(router MCPRouter) SSEOption {
+	return func(s *SSEServer) {
+		if router != nil {
+			s.mcpRouter = router
+		}
+	}
+}
+
 // NewSSEServer creates a new SSE server instance with the given MCP server and options.
 func NewSSEServer(server *server.MCPServer, opts ...SSEOption) *SSEServer {
 	s := &SSEServer{
@@ -197,6 +279,9 @@ func NewTestServer(server *server.MCPServer, opts ...SSEOption) *httptest.Server
 // Start begins serving SSE connections on the specified address.
 // It sets up HTTP handlers for SSE and message endpoints.
 func (s *SSEServer) Start(addr string) error {
+	// 挂载点和 wrapper 都由 ServeHTTP 内部处理：挂载点先分派出去，
+	// wrapper 只包主路径。因此这里把 s 直接交给 http.Server，
+	// 与改造前完全一致，也不需要额外的 mux。
 	s.mu.Lock()
 	s.srv = &http.Server{
 		Addr:    addr,

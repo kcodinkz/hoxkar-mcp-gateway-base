@@ -6,10 +6,10 @@ It turns one or many MCP backends into a single, authenticated, metered HTTP/SSE
 those backends from a service registry (r-nacos) instead of a hard-coded list.
 
 > **Project status: pre-1.0, under active development.**
-> The persistence, discovery and registry-synchronisation layers are complete and covered by tests.
-> The API-key authentication middleware, the `/admin/v1/*` management API and the namespace routing
-> layer are **not implemented yet** — see [Roadmap](#roadmap). Read [Known limitations](#known-limitations)
-> before deploying.
+> Persistence, discovery, registry synchronisation, API-key authentication (cache + RBAC), the
+> `/admin/v1/*` management API and namespace routing (stdio process pools + HTTP backends) are
+> complete and covered by tests. The admin web UI is not built yet — see [Roadmap](#roadmap).
+> Read [Known limitations](#known-limitations) before deploying.
 
 - [What it does](#what-it-does)
 - [Architecture](#architecture)
@@ -131,6 +131,13 @@ cannot corrupt the namespace table.
   `LISTEN/NOTIFY`, with a revision history table.
 - **Not-NULL discipline** — `NOT NULL` is used sparingly and the policy is self-checked at boot, so
   schema drift is caught early rather than at runtime.
+- **Unified API-key authentication** — keys are stored as hashes, verified once and cached, with
+  per-key rate limits and namespace/tool permissions (RBAC) resolved before any backend is contacted.
+- **Namespaced routing** — `/sse/{ns}` and `/messages/{ns}` resolve to a backend per namespace: a
+  stdio process pool for local debugging, or an HTTP reverse proxy to a discovered instance for
+  cluster traffic. A router-level tool check happens on every `tools/call`.
+- **Administration API** — `/admin/v1/*` covers tenants, users, keys, namespaces, settings, usage and
+  session review, guarded by a separate admin token that is never mixed with MCP client credentials.
 
 ---
 
@@ -588,16 +595,21 @@ curl -X DELETE "http://127.0.0.1:8848/nacos/v1/ns/service?serviceName=mcp-syncpr
 ```
 .
 ├── main.go                  # entry point: flags, startup order, shutdown order
+├── auth_setup.go            # multi-tenant auth + admin + routing assembly
 ├── registry_sync.go         # wiring for the registry synchroniser
 ├── maintenance.go           # background sweeps
 ├── bootstrap_gate.go        # post-migration self-checks
 ├── gateway/
 │   ├── sse.go               # SSE transport + message endpoint
-│   └── connection.go        # stdio <-> SSE bridging
+│   ├── connection.go        # stdio <-> SSE bridging
+│   └── namespaced.go        # namespaced MCP endpoint (/sse/{ns}, /messages/{ns})
 ├── internal/
 │   ├── config/              # config.yaml loading, env overrides, validation
 │   ├── discovery/           # service name -> healthy instances (static | r-nacos)
 │   ├── registry/            # registry catalog -> namespaces rows
+│   ├── routing/             # namespace -> backend (stdio pools, HTTP reverse proxy)
+│   ├── auth/                # API-key verification, cache, middleware, RBAC
+│   ├── admin/               # /admin/v1/* management API
 │   ├── store/               # PostgreSQL access, one file per domain
 │   ├── idgen/               # prefixed ID generation and parsing
 │   ├── shard/               # tenant -> shard mapping, per-shard connection pools
@@ -606,7 +618,7 @@ curl -X DELETE "http://127.0.0.1:8848/nacos/v1/ns/service?serviceName=mcp-syncpr
 │   ├── billing/             # metering, reserve/settle/release
 │   └── recorder/            # session capture + redaction
 ├── migrations/              # embedded SQL schema, indexes, seed data
-└── examples/                # minimal example backend
+└── examples/                # minimal example backend + slow-backend fixture
 ```
 
 ---
@@ -617,9 +629,9 @@ curl -X DELETE "http://127.0.0.1:8848/nacos/v1/ns/service?serviceName=mcp-syncpr
 | --- | --- | --- |
 | **Persistence** | Schema, migrations, prefixed IDs, sharding, settings, dynamic config | ✅ Complete |
 | **Registry sync** | Catalog polling, upsert, soft offline, source isolation | ✅ Complete |
-| **Authentication** | API-key verification, caching middleware, RBAC, management API | 🚧 Not started |
-| **Routing** | Namespace routing and process pool; slow-backend fixture | 🚧 Not started |
-| **Admin panel** | Web UI, invoices, richer metering | 📋 Planned |
+| **Authentication** | API-key verification, caching middleware, RBAC, management API | ✅ Complete |
+| **Routing** | Namespace routing and process pool; slow-backend fixture | ✅ Complete |
+| **Admin panel** | Next.js 14 web UI, invoices, richer metering | 📋 Planned |
 
 ---
 
@@ -627,15 +639,12 @@ curl -X DELETE "http://127.0.0.1:8848/nacos/v1/ns/service?serviceName=mcp-syncpr
 
 These are real, present constraints — not a wish list:
 
-1. **The HTTP serving path is not wired for multi-tenant mode yet.** Startup still funnels through the
-   legacy SSE server with `--command`. Without `--command` the process exits with
-   `exec: no command`. Database work, discovery and registry sync all run first, so the symptom is a
-   process that does a lot of correct work and then dies.
-2. **`auth.admin_token` is required but no `/admin/v1/*` handler exists.** Validation runs ahead of
-   implementation here.
-3. **No API-key middleware and no namespace routing.** Requests are not yet authenticated per key and
-   not yet routed per namespace.
-4. **No standalone `LICENSE` file.** The licence terms live in the [License](#license) section below;
+1. **There is no admin web UI.** The `/admin/v1/*` HTTP API is complete and covered by tests, but the
+   panel that drives it does not exist yet, so administration is done with `curl` for the time being.
+2. **The legacy `--command` path is deliberately frozen.** It still uses one shared token
+   (`--oauth2Bearer`), splits the command line on spaces, and knows nothing about namespaces. Treat it
+   as a compatibility shim for existing deployments, not as the recommended way to run the gateway.
+3. **No standalone `LICENSE` file.** The licence terms live in the [License](#license) section below;
    a machine-readable file is still missing.
 
 ---

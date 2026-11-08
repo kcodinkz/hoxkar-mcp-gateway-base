@@ -307,7 +307,7 @@ func run(f cliFlags) error {
 	log.Printf("会话录制：enabled=%v（动态配置 recording.enabled 可覆盖）", rt.recorder.Enabled())
 
 	// -----------------------------------------------------------------------
-	// 5. 注册中心同步（注册中心同步）：把 r-nacos 里的服务清单变成命名空间行
+	// 5. 注册中心同步：把 r-nacos 里的服务清单变成命名空间行
 	//
 	// 位置是刻意的：必须排在 discovery.Build 之后（要拿它的 Lister 能力），
 	// 又必须排在 serveForever 之前（否则首批请求到达时命名空间还没建出来）。
@@ -326,10 +326,40 @@ func run(f cliFlags) error {
 	rt.maint = startMaintenance(ctx, st, cfg.Maintenance)
 
 	// -----------------------------------------------------------------------
-	// 7. 旧路径兼容：数据库里若有 stdio 的 default 命名空间，
-	//    仍然可以让 -command 指向它，避免改动老的启动脚本
+	// 7. 鉴权与管理端：只有多租户模式才装配
+	//
+	// 这里是整条编排里唯一会引入「API Key + 管理接口」的地方。放在最后紧贴
+	// serveForever，是因为它依赖的前置（迁移完成、命名空间已自举）都在上面。
+	//
+	// 装配完成后，/sse 与 /messages 走 API Key 鉴权，/admin/v1/* 走管理 token。
+	// 管理 token 缺失时 New 会直接报错，不会退化成「无鉴权的管理接口」——
+	// 配置校验里也拦了一遍，两处都拦是因为 admin 包也可能被单独构造。
 	// -----------------------------------------------------------------------
-	return serveForever(cfg, buildLegacyCommand(f.command))
+	stack, err := buildAuthStack(st, cfg, bundle)
+	if err != nil {
+		return fmt.Errorf("初始化鉴权与管理端失败: %w", err)
+	}
+	// 关闭顺序：defer 是后进先出，这里晚于 rt.close 注册、因此先于它执行。
+	// 必须赶在连接池关闭之前回收 stdio 子进程 —— 它们退出时的日志与清理
+	// 不依赖数据库，但让它们多活一会儿只会让「谁还没关」更难查。
+	defer func() {
+		if cerr := stack.Close(); cerr != nil {
+			log.Printf("[routing] 关闭后端工厂时出错：%v", cerr)
+		}
+	}()
+	log.Printf("鉴权已就绪：API Key 缓存 TTL=%s，管理端挂载于 %s，MCP 入口=%s 与 %s/{ns}",
+		time.Duration(cfg.Auth.KeyCacheTTLSeconds)*time.Second, adminPrefix,
+		cfg.Server.SSEPath, cfg.Server.SSEPath)
+
+	// -----------------------------------------------------------------------
+	// 8. MCP 端点：多租户模式下 /sse 与 /messages 由 NamespacedMCP 接管。
+	//
+	// -command 在这里只是「兼容旧脚本」的可选参数：给了就仍然拉起一个本地
+	// stdio 子进程挂在旧路径上，不给就纯 HTTP 服务。真正的后端来自 r-nacos，
+	// 不需要也不应该由命令行指定 —— 那正是「集群前沿」与「本地 MCP 包装器」
+	// 的分界线。
+	// -----------------------------------------------------------------------
+	return serveForever(cfg, buildLegacyCommand(f.command), stack.options()...)
 }
 
 // applyFlagOverrides 只在参数被显式传入时才覆盖配置，
@@ -403,7 +433,7 @@ func rewriteBaseURLPort(baseURL string, oldPort, newPort int) string {
 // # 为什么必须显式写 SourceConfig
 //
 // 不写的话 store 层会按零值兜底成 manual，于是这些行看起来像是管理员手工建的。
-// 而注册中心同步器只碰 source='registry' 的行（注册中心同步第一条铁律），
+// 而注册中心同步器只碰 source='registry' 的行（注册中心同步的第一条铁律），
 // 一旦 config 自举出来的行被标成 manual，语义上就分不清「谁该管它」：
 // 接入方在注册中心注册了同名服务，同步器会因为 source 不匹配而永远建不出来，
 // 报出来的却是一个看不出根因的 slug 冲突。
@@ -472,7 +502,10 @@ func buildLegacyCommand(command string) gateway.McpCommand {
 }
 
 // serveForever 组装 SSE 服务并阻塞到进程收到退出信号。
-func serveForever(cfg *config.Config, mcpCommand gateway.McpCommand) error {
+//
+// extra 是多租户模式传入的额外选项（API Key 中间件 + 管理端挂载）。
+// 旧启动路径不传任何 extra，选项列表与改造前逐条一致。
+func serveForever(cfg *config.Config, mcpCommand gateway.McpCommand, extra ...gateway.SSEOption) error {
 	s := server.NewMCPServer(cfg.Server.Name, cfg.Server.Version)
 
 	var opt []gateway.SSEOption
@@ -484,6 +517,7 @@ func serveForever(cfg *config.Config, mcpCommand gateway.McpCommand) error {
 	if cfg.Auth.BearerToken != "" {
 		opt = append(opt, gateway.WithOAuth2Bearer(cfg.Auth.BearerToken))
 	}
+	opt = append(opt, extra...)
 
 	sseServer := gateway.NewSSEServer(s, opt...)
 	gatewayServer := gateway.NewGatewaySSEServer(mcpCommand, sseServer)

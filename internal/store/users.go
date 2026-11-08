@@ -95,6 +95,45 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*User, error)
 	return scanUser(row)
 }
 
+// ListUsers 分页列出账号，供管理端使用（分页契约）。
+//
+// 排序固定 (created_at DESC, id DESC)：created_at 是 TIMESTAMPTZ，批量导入
+// 时同一毫秒会有多行，只按时间排序时 PostgreSQL 两次查询的相对顺序不保证，
+// OFFSET 翻页就会重复或漏行，所以必须补主键作 tiebreaker。
+func (s *Store) ListUsers(ctx context.Context, page, pageSize int) ([]User, int64, error) {
+	page, pageSize, offset := normalizePage(page, pageSize)
+
+	var total int64
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM users`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("统计用户数量失败: %w", err)
+	}
+	if total == 0 {
+		return []User{}, 0, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+userColumns+` FROM users
+		ORDER BY created_at DESC, id DESC
+		LIMIT $1 OFFSET $2`, pageSize, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("列出用户失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]User, 0, pageSize)
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, *u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("遍历用户结果失败: %w", err)
+	}
+	return out, total, nil
+}
+
 func scanUser(row pgx.Row) (*User, error) {
 	var (
 		u         User
